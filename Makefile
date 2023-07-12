@@ -1,6 +1,6 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -Wpedantic
-LDFLAGS = 
+LDFLAGS = -pthread
 
 client: client.c
 	$(CC) $(CFLAGS) -o client client.c $(LDFLAGS)
