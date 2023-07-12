@@ -1,0 +1,7 @@
+#ifndef DEF_COMMON
+#define DEF_COMMON
+
+#define MAX_USERNAME_LENGTH 32
+#define MAX_MSG_LENGTH 1024
+
+#endif
