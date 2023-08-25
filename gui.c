@@ -14,8 +14,8 @@
 
 WINDOW *chat_win, *input_win, *users_win;
 
-wchar_t *buf_left = NULL;
-wchar_t *buf_right = NULL;
+char *buf_left = NULL;
+char *buf_right = NULL;
 int length_right = 0;
 int length_left = 0;
 int capacity = MAX_MSG_LENGTH + 1;
@@ -28,8 +28,8 @@ bool input_enabled = true;
 void init_zipper(int max_length) {
     free(buf_left);
     free(buf_right);
-    buf_right = malloc(sizeof(wchar_t) * (max_length + 1));
-    buf_left = malloc(sizeof(wchar_t) * (max_length + 1));
+    buf_right = malloc(sizeof(char) * (max_length + 1));
+    buf_left = malloc(sizeof(char) * (max_length + 1));
     for (int i = 0; i < max_length + 1; i++) {
         buf_left[i] = '\0';
     }
@@ -106,7 +106,7 @@ void display_zipper() {
 
     if (cursor_block == 0) {
         // No scroll to the left
-        mvwprintw(input_win, 0, 0, "%ls%.*ls ", buf_left, COLS - 3 - length_left, buf_right + (capacity - length_right));
+        mvwprintw(input_win, 0, 0, "%s%.*s ", buf_left, COLS - 3 - length_left, buf_right + (capacity - length_right));
 
         if (length_right > COLS - 2 - length_left) {
             // Text overflows to right
@@ -123,7 +123,7 @@ void display_zipper() {
         wattron(input_win, A_REVERSE);
         mvwprintw(input_win, 0, 0, "<");
         wattroff(input_win, A_REVERSE);
-        wprintw(input_win, "%ls%.*ls ", buf_left + nb_skip_left, COLS - 3 - (length_left - nb_skip_left), buf_right + (capacity - length_right));
+        wprintw(input_win, "%s%.*s ", buf_left + nb_skip_left, COLS - 3 - (length_left - nb_skip_left), buf_right + (capacity - length_right));
 
         if (length_right > COLS - 2 - (length_left - nb_skip_left)) {
             // Text overflows to right
@@ -310,20 +310,15 @@ int gui_input(char *dest, int maxlength) {
 
     int length = length_left + length_right;
 
-    fwprintf(stderr, L"Read : '%ls%ls'\n", buf_left, buf_right + (capacity - length_right));
-
-    #if false
     memcpy(dest, buf_left, length_left);
     memcpy(dest + length_left, buf_right + capacity - length_right, length_right);
 
     dest[length] = '\0';
-    #endif
 
     zip_clear();
     mvwprintw(input_win, 0, 0, "%-*s", COLS - 2, "");
     wrefresh(input_win);
 
-    return 0;
     return length;
 }
 
@@ -367,7 +362,7 @@ void test_gui() {
             if (length_left + length_right == 0) continue;
 
             wattron(chat_win, COLOR_PAIR(1));
-            wprintw(chat_win, "\n%ls%ls", buf_left, buf_right + (capacity - length_right));
+            wprintw(chat_win, "\n%s%s", buf_left, buf_right + (capacity - length_right));
             wattroff(chat_win, COLOR_PAIR(1));
             zip_clear();
             mvwprintw(input_win, 0, 0, "%-*s", COLS - 2, "");
