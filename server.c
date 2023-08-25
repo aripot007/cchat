@@ -1,12 +1,15 @@
 #include <arpa/inet.h>
 #include <asm-generic/errno.h>
+#include <bits/pthreadtypes.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 #include <sys/socket.h>
+#include <sys/types.h>
 #include <unistd.h>
 #include <pthread.h>
 #include <semaphore.h>
@@ -23,6 +26,7 @@ const char MAX_CONN_REACHED_MSG[] = "The server reached its maximum number of co
 sem_t available_connections;
 pthread_mutex_t clients_lock;
 struct client *clients;
+pthread_t *client_threads;
 
 void print_usage(char *progName) {
     printf("Usage : %s [port]\n", progName);
@@ -154,52 +158,72 @@ char *read_username(Socket s) {
     return username;
 }
 
+/*
+ * Remove a client from the list of clients. If `cancel_thread` is true, cancel the thread used to handle the client.
+ * If this is called from the client handler thread, `cancel_thread` should be `false`.
+ */
+void remove_client(struct client client, bool cancel_thread) {
+
+    pthread_mutex_lock(&clients_lock);
+
+    close(clients[client.id].sock);
+    clients[client.id].sock = -1;
+
+    if (cancel_thread) {
+        pthread_cancel(client_threads[client.id]);
+    }
+
+    pthread_mutex_unlock(&clients_lock);
+
+    sem_post(&available_connections);
+}
+
 void *handle_client(void *args) {
 
     struct client client = *(struct client *)(args);
 
-    char buff[MAX_MSG_LENGTH + 1];
-    bool overflow = false;  // true if the client sent a message too long to fit into the buffer
-    char overflowed_char = '\0';
+    char utf8_buff[(MAX_MSG_LENGTH + 1) * UTF8_SEQUENCE_MAXLEN];
 
     int nread = 0;
+    uint32_t msglen;
 
     while (true) {
 
-        if (overflow) {
-            nread = read(client.sock, buff + 1, MAX_MSG_LENGTH);
-        } else {
-            nread = read(client.sock, buff, MAX_MSG_LENGTH + 1);
-        }
+        nread = read(client.sock, utf8_buff, sizeof(uint32_t));
 
         // Stop communicating with the client
         if (nread <= 0) break;
 
-        if (nread == (overflow ? MAX_MSG_LENGTH : MAX_MSG_LENGTH + 1) && buff[MAX_MSG_LENGTH] != '\0') {
-            overflow = true;
-            overflowed_char = buff[MAX_MSG_LENGTH];
-            buff[MAX_MSG_LENGTH] = '\0';
-        } else {
-            overflow = false;
+        msglen = ntohl(*(uint32_t*)utf8_buff);
+
+        fprintf(stderr, "New packet from %s : nread=%d, msglen=%d\n", client.name, nread, msglen);
+
+        if (nread != sizeof(uint32_t)) {
+            printf("[ERROR] Error reading packet size from client '%s', closing connection.\n", client.name);
+            remove_client(client, true);
+            return NULL;
         }
 
-        broadcast_msg(buff, client.id);
-
-        if (overflow) {
-            buff[0] = overflowed_char;
+        if (msglen > sizeof(utf8_buff)) {
+            printf("[ERROR] Error reading packet from '%s' : packet too large\n", client.name);
+            remove_client(client, true);
+            return NULL;
         }
+
+        nread = read(client.sock, utf8_buff, msglen);
+
+        // Stop communicating with the client
+        if (nread <= 0) break;
+
+        broadcast_msg(utf8_buff, client.id);
+
     }
 
     // Disconnect client
-    pthread_mutex_lock(&clients_lock);
-    close(client.sock);
-    clients[client.id].sock = -1;
-    pthread_mutex_unlock(&clients_lock);
+    remove_client(client, false);
 
-    sprintf(buff, "[SYSTEM] %.*s left the chat !", MAX_USERNAME_LENGTH, client.name);
-    broadcast_msg(buff, -1);
-
-    sem_post(&available_connections);
+    sprintf(utf8_buff, "[SYSTEM] %.*s left the chat !", MAX_USERNAME_LENGTH, client.name);
+    broadcast_msg(utf8_buff, -1);
 
     return NULL;
 
@@ -226,7 +250,7 @@ int main(int argc, char* argv[]) {
 
     err = listen(s, CONN_BACKLOG_SIZE);
 
-    pthread_t *client_threads = malloc(sizeof(pthread_t) * MAX_CONNECTIONS);
+    client_threads = malloc(sizeof(pthread_t) * MAX_CONNECTIONS);
     clients = malloc(sizeof(struct client) * MAX_CONNECTIONS);
 
     for (int i = 0; i < MAX_CONNECTIONS; i++) {
