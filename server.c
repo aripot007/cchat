@@ -97,26 +97,27 @@ Socket init_socket(int port, int backlog_size) {
 
 }
 
-void broadcast_msg(const char *msg, int from) {
+// Broadcast a message encoded in utf-8
+void broadcast_msg(const char *utf8_msg, int from) {
 
     pthread_mutex_lock(&clients_lock);
 
-    char buff[MAX_MSG_LENGTH + 1];
+    char buff[(MAX_MSG_LENGTH + 1) * UTF8_SEQUENCE_MAXLEN];
 
     if (from >= 0) {
-        sprintf(buff, "%.*s : %.*s", MAX_USERNAME_LENGTH, clients[from].name, MAX_MSG_LENGTH - (int)strlen(clients[from].name) - 3, msg);
+        sprintf(buff, "%.*s : %.*s", MAX_USERNAME_LENGTH, clients[from].name, MAX_MSG_LENGTH - (int)strlen(clients[from].name) - 3, utf8_msg);
         printf("[CHAT:%.*s] : %s\n", MAX_USERNAME_LENGTH, clients[from].name, buff);
     } else {
-        sprintf(buff, "%.*s", MAX_MSG_LENGTH, msg);
+        sprintf(buff, "%.*s", MAX_MSG_LENGTH, utf8_msg);
         printf("[CHAT#SYSTEM] : %s\n", buff);
     }
 
-    
-
-    int msg_length = strlen(buff);
+    uint32_t msg_length = strlen(buff);
+    uint32_t packet_length = htonl(msg_length + 1);
 
     for (int i = 0; i < MAX_CONNECTIONS; i++) {
         if (clients[i].sock < 0 || i == from) continue;
+        write(clients[i].sock, (char*) &packet_length, sizeof(uint32_t));
         write(clients[i].sock, buff, msg_length + 1);
     }
 
