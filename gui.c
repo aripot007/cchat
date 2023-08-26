@@ -228,6 +228,8 @@ void destroy_gui() {
 void print_user_msg(char *msg) {
     wprintw(chat_win, "\n%s", msg);
     wrefresh(chat_win);
+    wmove(input_win, 0, cursor_pos);
+    wrefresh(input_win);
 }
 
 void print_system_msg(char *msg) {
@@ -235,6 +237,8 @@ void print_system_msg(char *msg) {
     wprintw(chat_win, "\n%s", msg);
     wattroff(chat_win, COLOR_PAIR(1));
     wrefresh(chat_win);
+    wmove(input_win, 0, cursor_pos);
+    wrefresh(input_win);
 }
 
 /*
@@ -284,9 +288,10 @@ char *process_input() {
 
         zip_clear();
         mvwprintw(input_win, 0, 0, "%-*s", COLS - 2, "");
-        wrefresh(input_win);
-        wprintw(chat_win, "%s\n", msg);
+        wprintw(chat_win, "\n%s", msg);
         wrefresh(chat_win);
+        wmove(input_win, 0, cursor_pos);
+        wrefresh(input_win);
 
         return msg;
 
