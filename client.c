@@ -1,57 +1,112 @@
 #include <arpa/inet.h>
+#include <sys/poll.h>
+#include <wchar.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <stdbool.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 #include <sys/socket.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <iconv.h>
+#include <stdarg.h>
+#include <signal.h>
+#include <poll.h>
 #include "socket.h"
 #include "common.h"
+#include "gui.h"
+
+Socket sock;
+
+char information_message[1024];
 
 void print_usage(char *progName) {
     printf("Usage : %s USERNAME HOST [port]\n", progName);
 }
 
-Socket sock;
+Socket init_socket(char *host, char *port) {
 
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wunused-parameter"
+    Socket s;
 
-void *handle_receive(void *args) {
+    struct addrinfo *res = NULL;
 
-#pragma GCC diagnostic pop
+    struct addrinfo hints = {0};
+    hints.ai_family = AF_UNSPEC;    /* Allow IPv4 or IPv6 */
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = 0;
+    hints.ai_protocol = 0; /* Any protocol*/
 
-    char buff[MAX_MSG_LENGTH + 1];
-    buff[MAX_MSG_LENGTH] = '\0';
-
-    int nread = 0;
-
-    while (true) {
-
-        nread = read(sock, buff, MAX_MSG_LENGTH);
-
-        // Stop communicating with the server
-        if (nread <= 0) break;
-
-        // If the message was too long to fit into the buffer, do not print a newline
-        if (nread == MAX_MSG_LENGTH && buff[MAX_MSG_LENGTH - 1] != '\0') {
-            printf("%s", buff);
-        } else {
-            printf("%s\n", buff);
-        }
+    int err = getaddrinfo(host, port, &hints, &res);
+    if(err != 0) {
+        fprintf(stderr, "%s\n", gai_strerror(err));
+        return -1;
     }
 
-    
+    struct addrinfo *rp;
 
-    fprintf(stderr, "Connection lost\n");
-    close(sock);
+    for(rp = res; rp != NULL; rp = rp->ai_next) {
 
-    exit(EXIT_SUCCESS);
+        s = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
 
-    return NULL;
+        if (s == -1) continue;
+
+        if (connect(s, rp->ai_addr, rp->ai_addrlen) != -1) break;  /* Success */
+
+        close(s);
+
+    }
+
+    freeaddrinfo(res);
+    if (rp == NULL) {
+        fprintf(stderr, "Could not connect to host\n");
+        return -1;
+    }
+
+    return s;
+
+}
+
+void throw(const char *format, ...) {
+    va_list args;
+    va_start(args, format);
+    destroy_gui();
+    vfprintf(stderr, format, args);
+    fprintf(stderr, "\n");
+    exit(EXIT_FAILURE);
+}
+
+void handle_receive() {
+
+    char utf8_buff[(MAX_MSG_LENGTH + 1) * UTF8_SEQUENCE_MAXLEN];
+
+    size_t nread = 0;
+
+    nread = read(sock, utf8_buff, sizeof(uint32_t));
+
+    if (nread != sizeof(uint32_t)) {
+        close(sock);
+        throw("Error while reading packet size (read %d instead of %d)", nread, sizeof(uint32_t));
+    }
+
+    uint32_t msg_len = ntohl(*(uint32_t*)(utf8_buff));
+
+    if (msg_len >= sizeof(utf8_buff)) {
+        close(sock);
+        throw("Error while receiving message : packet too large (got %d, buffer is %d)", msg_len, sizeof(utf8_buff));
+    }
+
+    nread = read(sock, utf8_buff, msg_len);
+
+    if (nread != msg_len) {
+        close(sock);
+        throw("Error while receiving message : packet size does not match");
+    }
+
+    print_user_msg(utf8_buff);
+
 }
 
 int main(int argc, char* argv[]) {
@@ -62,8 +117,8 @@ int main(int argc, char* argv[]) {
     }
 
     char *username = argv[1];
-    unsigned char username_length = strlen(username);
-    if (username_length > 32 || username_length <= 0) {
+    unsigned long username_length = strlen(username);
+    if (username_length > MAX_USERNAME_LENGTH || username_length <= 0) {
         fprintf(stderr, "Username too long (max 32 characters)\n");
         return EXIT_FAILURE;
     }
@@ -77,68 +132,83 @@ int main(int argc, char* argv[]) {
             return EXIT_FAILURE;
         }
     }
+    
+    sock = init_socket(argv[2], (port == -1 ? DEFAULT_PORT_STR : argv[3]));
 
-    struct addrinfo *res = NULL;
-
-    struct addrinfo hints = {0};
-    hints.ai_family = AF_UNSPEC;    /* Allow IPv4 or IPv6 */
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_flags = 0;
-    hints.ai_protocol = 0; /* Any protocol*/
-
-    int err = getaddrinfo(argv[2], (port == -1 ? DEFAULT_PORT_STR : argv[3]), &hints, &res);
-    if(err != 0) {
-        fprintf(stderr, "%s\n", gai_strerror(err));
+    if (sock < 0 ) {
         return EXIT_FAILURE;
     }
 
-    struct addrinfo *rp;
-
-    for(rp = res; rp != NULL; rp = rp->ai_next) {
-
-        sock = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-
-        if (sock == -1) continue;
-
-        if (connect(sock, rp->ai_addr, rp->ai_addrlen) != -1) break;  /* Success */
-
-        close(sock);
-
-    }
-
-    freeaddrinfo(res);
-    if (rp == NULL) {
-        fprintf(stderr, "Could not connect to host\n");
-        return EXIT_FAILURE;
-    }
+    init_gui(MAX_MSG_LENGTH - username_length - 1);
 
     // Send username information
     char *username_msg = malloc(sizeof(char) * (username_length + 2));
     username_msg[0] = username_length;
-    strcpy(&username_msg[1], username);
-
+    strncpy(&username_msg[1], username, username_length);
+    username_msg[username_length + 1] = '\0';
     write(sock, username_msg, sizeof(char) * (username_length + 2));
 
-    printf("Connected to %s on port %s as %s !\n", argv[2], (port == -1 ? DEFAULT_PORT_STR : argv[3]), argv[1]);
+    sprintf(information_message, "Connected to %s on port %s as %s !\n", argv[2], (port == -1 ? DEFAULT_PORT_STR : argv[3]), argv[1]);
+    print_system_msg(information_message);
 
-    pthread_t receive_thread;
-    pthread_create(&receive_thread, NULL, handle_receive, NULL);
+    struct pollfd *fds = malloc(sizeof(struct pollfd) * 2);
 
-    char buff[MAX_MSG_LENGTH + 1];
+    fds[0].fd = STDIN_FILENO;
+    fds[0].events = POLLIN;
+
+    fds[1].fd = sock;
+    fds[1].events = POLLIN;
+
+    int poll_res;
 
     while (true) {
 
-        char *res = fgets(buff, MAX_MSG_LENGTH + 1, stdin);
+        poll_res = poll(fds, 2, -1);
 
-        if (res == NULL) continue;
+        if (poll_res < 0 && errno != EINTR) {
+            destroy_gui();
+            fprintf(stderr, "Error while polling : %d\n", errno);
+            close(sock);
+            return EXIT_FAILURE;
+        }
 
-        // Remove trailing '\n'
-        int len = strlen(buff);
-        if (len > 0 && buff[len - 1] == '\n') buff[len - 1] = '\0';
+        if (poll_res == 0) continue;
 
-        write(sock, buff, len + 1);
+        if (fds[1].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            print_system_msg("Connection lost. Quitting in 5 seconds ...");
+            sleep(5);
+            destroy_gui();
+            fprintf(stderr, "Server connection lost.\n");
+            return EXIT_SUCCESS;
+        }
+
+        // Process user input
+        if (fds[0].revents & POLLIN) {
+
+            char *msg = process_input();
+
+            if (msg != NULL) {
+
+                int msg_len = strlen(msg) + 1;
+
+                uint32_t packet_size = htonl(msg_len);
+                write(sock, &packet_size, sizeof(uint32_t));
+                write(sock, msg, msg_len);
+
+            }
+
+        }
+
+        // Process received data
+        if (fds[1].revents & POLLIN) {
+
+            handle_receive();
+
+        }
 
     }
 
+    sleep(5);
+    destroy_gui();
     return EXIT_SUCCESS;
 }

@@ -7,10 +7,10 @@
 #include <string.h>
 #include <unctrl.h>
 #include <stdlib.h>
+#include <pthread.h>
+#include <unistd.h>
 #include "gui.h"
 #include "common.h"
-
-#include <time.h>
 
 WINDOW *chat_win, *input_win, *users_win;
 
@@ -22,8 +22,6 @@ int capacity = MAX_MSG_LENGTH + 1;
 
 int cursor_pos = 0;
 int cursor_block = 0;
-
-bool input_enabled = true;
 
 void init_zipper(int max_length) {
     free(buf_left);
@@ -178,7 +176,7 @@ void drawborders() {
 
 }
 
-void init_gui() {
+void init_gui(int msg_maxlength) {
     
     setlocale(LC_CTYPE, "");
 
@@ -207,25 +205,24 @@ void init_gui() {
     wmove(input_win, 0, 0);
     wmove(chat_win, LINES - 6, 0);
 
+    // Initialize input
+
+    init_zipper(msg_maxlength);
+    display_zipper();
+
+    wmove(input_win, 0, 0);
+
     wrefresh(chat_win);
     wrefresh(input_win);
-    wrefresh(users_win); 
-
-    input_enabled = true;
+    wrefresh(users_win);
+    
+    refresh();
 
 }
 
 void destroy_gui() {
     echo();
     endwin();
-}
-
-void enable_input() {
-    input_enabled = true;
-}
-
-void disable_input() {
-    input_enabled = false;
 }
 
 void print_user_wmsg(wchar_t *msg) {
@@ -252,135 +249,73 @@ void print_system_msg(char *msg) {
     wrefresh(chat_win);
 }
 
-int gui_input(char *dest, int maxlength) {
-    int ch = 0;
+/*
+ * Processes input from the user. If the user submitted its input by pressing ENTER, returns a buffer containing the message, otherwise returns NULL.
+*/
+char *process_input() {
 
-    init_zipper(maxlength);
-    display_zipper();
+    int ch = getch();
 
-    wmove(input_win, 0, 0);
-    while (input_enabled) {
+    if (ch == KEY_LEFT) {
 
-        ch = getch();
+        if (cursor_pos == 0) return NULL;
+        zip_move_left();
+        cursor_pos--;
 
-        if (ch == KEY_LEFT) {
+    } else if (ch == KEY_RIGHT) {
 
-            if (cursor_pos == 0) continue;
-            zip_move_left();
-            cursor_pos--;
+        if (length_right == 0) return NULL;
 
-        } else if (ch == KEY_RIGHT) {
+        zip_move_right();
+        cursor_pos++;
 
-            if (length_right == 0) continue;
+    } else if (ch == KEY_BACKSPACE) {
 
-            zip_move_right();
-            cursor_pos++;
-        } else if (ch == KEY_BACKSPACE) {
+        if (cursor_pos == 0) return NULL;
+        zip_del_char();
+        cursor_pos--;
 
-            if (cursor_pos == 0) continue;
-            zip_del_char();
-            cursor_pos--;
+    } else if (ch == KEY_DC) {
 
-        } else if (ch == KEY_DC) {
+        zip_del_char_right();
 
-            zip_del_char_right();
+    } else if (ch == KEY_ENTER || ch == '\n') {
 
-        } else if (ch == KEY_ENTER || ch == '\n') {
+        // User submitted its message
 
-            if (length_left + length_right == 0) continue;
+        if (length_left + length_right == 0) return NULL;
 
-            break;
+        int length = length_left + length_right;
 
-        } else {
+        char *msg = malloc(sizeof(char) * (length + 1));
 
-            if (length_left + length_right >= capacity) continue;
+        memcpy(msg, buf_left, length_left);
+        memcpy(msg + length_left, buf_right + capacity - length_right, length_right);
 
-            // Non-printable / control character
-            if (strlen(unctrl(ch)) != 1) continue;
+        msg[length] = '\0';
 
-            zip_add_char(ch);
-            cursor_pos++;
+        zip_clear();
+        mvwprintw(input_win, 0, 0, "%-*s", COLS - 2, "");
+        wrefresh(input_win);
+        wprintw(chat_win, "%s\n", msg);
+        wrefresh(chat_win);
 
-        }
+        return msg;
 
-        display_zipper();
-    }
+    } else {
 
-    if (!input_enabled) return -1;
+        if (length_left + length_right >= capacity) return NULL;
 
-    int length = length_left + length_right;
+        // Non-printable / control character
+        if (strlen(unctrl(ch)) != 1) return NULL;
 
-    memcpy(dest, buf_left, length_left);
-    memcpy(dest + length_left, buf_right + capacity - length_right, length_right);
-
-    dest[length] = '\0';
-
-    zip_clear();
-    mvwprintw(input_win, 0, 0, "%-*s", COLS - 2, "");
-    wrefresh(input_win);
-
-    return length;
-}
-
-void test_gui() {
-
-    int ch = 0;
-
-    init_zipper(COLS * 2 + 10);
-    display_zipper();
-
-    wmove(input_win, 0, 0);
-    wmove(chat_win, LINES - 6, 0);
-    while (true) {
-
-        ch = getch();
-
-        if (ch == KEY_LEFT) {
-
-            if (cursor_pos == 0) continue;
-            zip_move_left();
-            cursor_pos--;
-
-        } else if (ch == KEY_RIGHT) {
-
-            if (length_right == 0) continue;
-
-            zip_move_right();
-            cursor_pos++;
-        } else if (ch == KEY_BACKSPACE) {
-
-            if (cursor_pos == 0) continue;
-            zip_del_char();
-            cursor_pos--;
-
-        } else if (ch == KEY_DC) {
-
-            zip_del_char_right();
-
-        } else if (ch == KEY_ENTER || ch == '\n') {
-
-            if (length_left + length_right == 0) continue;
-
-            wattron(chat_win, COLOR_PAIR(1));
-            wprintw(chat_win, "\n%s%s", buf_left, buf_right + (capacity - length_right));
-            wattroff(chat_win, COLOR_PAIR(1));
-            zip_clear();
-            mvwprintw(input_win, 0, 0, "%-*s", COLS - 2, "");
-            wrefresh(chat_win);
-
-        } else {
-
-            if (length_left + length_right >= capacity) continue;
-
-            // Non-printable / control character
-            if (strlen(unctrl(ch)) != 1) continue;
-
-            zip_add_char(ch);
-            cursor_pos++;
-
-        }
-
-        display_zipper();
+        zip_add_char(ch);
+        cursor_pos++;
 
     }
+
+    display_zipper();
+
+    return NULL;
+
 }
