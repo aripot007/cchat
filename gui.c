@@ -225,20 +225,8 @@ void destroy_gui() {
     endwin();
 }
 
-void print_user_wmsg(wchar_t *msg) {
-    wprintw(chat_win, "\n%ls", msg);
-    wrefresh(chat_win);
-}
-
 void print_user_msg(char *msg) {
     wprintw(chat_win, "\n%s", msg);
-    wrefresh(chat_win);
-}
-
-void print_system_wmsg(wchar_t *msg) {
-    wattron(chat_win, COLOR_PAIR(1));
-    wprintw(chat_win, "\n%ls", msg);
-    wattroff(chat_win, COLOR_PAIR(1));
     wrefresh(chat_win);
 }
 
