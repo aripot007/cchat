@@ -7,6 +7,8 @@
 // How many messages should be kept in the buffer when they scroll out of the chat window 
 #define CHAT_BUFFER_SIZE 50
 
+#include "client.h"
+
 void init_gui();
 void destroy_gui();
 
@@ -16,9 +18,11 @@ void destroy_gui();
 char *process_input();
 
 // Print a user message in the chat window
-void print_user_msg(char *msg);
+void print_user_msg(char *msg, ...);
 
 // Print a system message in the chat window
-void print_system_msg(char *msg);
+void print_system_msg(char *msg, ...);
+
+void display_userlist(struct client *clients);
 
 #endif

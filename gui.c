@@ -225,20 +225,43 @@ void destroy_gui() {
     endwin();
 }
 
-void print_user_msg(char *msg) {
-    wprintw(chat_win, "\n%s", msg);
+void print_user_msg(char *msg, ...) {
+    va_list args;
+    va_start(args, msg);
+    wprintw(chat_win, "\n");
+    vw_printw(chat_win, msg, args);
     wrefresh(chat_win);
     wmove(input_win, 0, cursor_pos);
     wrefresh(input_win);
 }
 
-void print_system_msg(char *msg) {
+void print_system_msg(char *msg, ...) {
+    va_list args;
+    va_start(args, msg);
     wattron(chat_win, COLOR_PAIR(1));
-    wprintw(chat_win, "\n%s", msg);
+    wprintw(chat_win, "\n");
+    vw_printw(chat_win, msg, args);
     wattroff(chat_win, COLOR_PAIR(1));
     wrefresh(chat_win);
     wmove(input_win, 0, cursor_pos);
     wrefresh(input_win);
+}
+
+void display_userlist(struct client *clients) {
+
+    wmove(users_win, 0, 0);
+
+    struct client *c = clients;
+
+    while(c != NULL) {
+        wprintw(users_win, "%s\n", c->name);
+        c = c->next;
+    }
+
+    wrefresh(users_win);
+    wmove(input_win, 0, cursor_pos);
+    wrefresh(input_win);
+
 }
 
 /*
@@ -288,8 +311,6 @@ char *process_input() {
 
         zip_clear();
         mvwprintw(input_win, 0, 0, "%-*s", COLS - 2, "");
-        wprintw(chat_win, "\n%s", msg);
-        wrefresh(chat_win);
         wmove(input_win, 0, cursor_pos);
         wrefresh(input_win);
 

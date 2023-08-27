@@ -16,6 +16,7 @@
 #include <stdbool.h>
 #include "socket.h"
 #include "common.h"
+#include "packets.h"
 
 #define BUFF_SIZE 1024
 #define CONN_BACKLOG_SIZE 5
@@ -24,6 +25,7 @@
 const char MAX_CONN_REACHED_MSG[] = "The server reached its maximum number of connections, please try again later.\n";
 
 sem_t available_connections;
+int nb_clients = 0;
 pthread_mutex_t clients_lock;
 struct client *clients;
 pthread_t *client_threads;
@@ -101,28 +103,51 @@ Socket init_socket(int port, int backlog_size) {
 
 }
 
-// Broadcast a message encoded in utf-8
-void broadcast_msg(const char *utf8_msg, int from) {
+// Broadcast a message to all connected users
+void broadcast_msg(const char *buff, int from) {
+
+    int len = strlen(buff) + 1;
+
+    uint32_t packet[3] = {htonl(PA_MSG), htonl(from), htonl(len)};
 
     pthread_mutex_lock(&clients_lock);
 
-    char buff[(MAX_MSG_LENGTH + 1) * UTF8_SEQUENCE_MAXLEN];
-
-    if (from >= 0) {
-        sprintf(buff, "%.*s : %.*s", MAX_USERNAME_LENGTH, clients[from].name, MAX_MSG_LENGTH - (int)strlen(clients[from].name) - 3, utf8_msg);
-        printf("[CHAT:%.*s] : %s\n", MAX_USERNAME_LENGTH, clients[from].name, buff);
-    } else {
-        sprintf(buff, "%.*s", MAX_MSG_LENGTH, utf8_msg);
-        printf("[CHAT#SYSTEM] : %s\n", buff);
-    }
-
-    uint32_t msg_length = strlen(buff);
-    uint32_t packet_length = htonl(msg_length + 1);
-
     for (int i = 0; i < MAX_CONNECTIONS; i++) {
         if (clients[i].sock < 0 || i == from) continue;
-        write(clients[i].sock, (char*) &packet_length, sizeof(uint32_t));
-        write(clients[i].sock, buff, msg_length + 1);
+        write(clients[i].sock, packet, sizeof(packet));
+        write(clients[i].sock, buff, len);
+    }
+
+    pthread_mutex_unlock(&clients_lock);
+
+}
+
+void broadcast_join_message(int client_id) {
+
+    int username_len = strlen(clients[client_id].name) + 1;
+    uint32_t packet[3] = {htonl(PA_USRJOIN), htonl(client_id), htonl(username_len)};
+
+    pthread_mutex_lock(&clients_lock);
+
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        if (i == client_id || clients[i].sock == -1) continue;
+        write(clients[i].sock, &packet, sizeof(packet));
+        write(clients[i].sock, clients[client_id].name, username_len);
+    }
+
+    pthread_mutex_unlock(&clients_lock);
+
+}
+
+void broadcast_leave_message(uint32_t client_id) {
+
+    uint32_t packet[2] = {htonl(PA_USRLEAVE), htonl(client_id)};
+
+    pthread_mutex_lock(&clients_lock);
+
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        if (clients[i].sock == -1) continue;
+        write(clients[i].sock, &packet, sizeof(packet));
     }
 
     pthread_mutex_unlock(&clients_lock);
@@ -133,28 +158,34 @@ char *read_username(Socket s) {
 
     int nread;
     char buff[BUFF_SIZE] = {0};
+    uint32_t pa_num;
+    uint32_t username_len;
 
-    nread = read(s, buff, 1);
-    if (nread != 1) {
-        fprintf(stderr, "Error while reading username length\n");
+    nread = read(s, &pa_num, sizeof(uint32_t));
+    pa_num = ntohl(pa_num);
+
+    if (nread != sizeof(uint32_t) || pa_num != PA_USERNAME) {
+        fprintf(stderr, "Error while reading username packet\n");
         return NULL;
     }
-    char username_length = (unsigned char) buff[0];
 
-    if (username_length > MAX_USERNAME_LENGTH) {
-        username_length = MAX_USERNAME_LENGTH;
+    read(s, &username_len, sizeof(uint32_t));
+    username_len = ntohl(username_len);
+
+    if (username_len > MAX_USERNAME_LENGTH) {
+        username_len = MAX_USERNAME_LENGTH;
     }
 
-    nread = read(s, buff + 1 , sizeof(char) * (username_length + 1));
+    nread = read(s, buff , sizeof(char) * username_len);
 
-    if (nread != username_length + 1) {
-        fprintf(stderr, "Error while reading username (%d read, username length = %d)\n", nread, username_length);
+    if (nread != (int) username_len) {
+        fprintf(stderr, "Error while reading username (%d read, username length = %d)\n", nread, username_len);
         return NULL;
     }
 
     buff[MAX_USERNAME_LENGTH + 1] = '\0';
-    char *username = malloc(sizeof(char) * username_length + 1);
-    strcpy(username, buff + 1);
+    char *username = malloc(sizeof(char) * username_len);
+    strcpy(username, buff);
     return username;
 }
 
@@ -173,7 +204,11 @@ void remove_client(struct client client, bool cancel_thread) {
         pthread_cancel(client_threads[client.id]);
     }
 
+    nb_clients--;
+
     pthread_mutex_unlock(&clients_lock);
+
+    broadcast_leave_message(client.id);
 
     sem_post(&available_connections);
 }
@@ -182,48 +217,56 @@ void *handle_client(void *args) {
 
     struct client client = *(struct client *)(args);
 
-    char utf8_buff[(MAX_MSG_LENGTH + 1) * UTF8_SEQUENCE_MAXLEN];
+    char buff[MAX_MSG_LENGTH + 1];
 
     int nread = 0;
+    uint32_t pa_num;
     uint32_t msglen;
 
     while (true) {
 
-        nread = read(client.sock, utf8_buff, sizeof(uint32_t));
+        nread = read(client.sock, &pa_num, sizeof(uint32_t));
 
         // Stop communicating with the client
         if (nread <= 0) break;
 
-        msglen = ntohl(*(uint32_t*)utf8_buff);
+        pa_num = ntohl(pa_num);
 
-        fprintf(stderr, "New packet from %s : nread=%d, msglen=%d\n", client.name, nread, msglen);
-
-        if (nread != sizeof(uint32_t)) {
-            printf("[ERROR] Error reading packet size from client '%s', closing connection.\n", client.name);
+        if (nread != sizeof(uint32_t) || pa_num != PA_MSG) {
+            printf("[ERROR] Invalid packet %d from '%s', closing connection.\n", pa_num, client.name);
             remove_client(client, true);
             return NULL;
         }
 
-        if (msglen > sizeof(utf8_buff)) {
+        // Ignore client_id
+        read(client.sock, &pa_num, sizeof(uint32_t));
+
+        nread = read(client.sock, &msglen, sizeof(uint32_t));
+        msglen = ntohl(msglen);
+
+        if (nread < (int) sizeof(uint32_t)) {
+            printf("[ERROR] Invalid packet from '%s', closing connection.\n", client.name);
+            remove_client(client, true);
+            return NULL;
+        }
+
+        if (msglen > sizeof(buff)) {
             printf("[ERROR] Error reading packet from '%s' : packet too large\n", client.name);
             remove_client(client, true);
             return NULL;
         }
 
-        nread = read(client.sock, utf8_buff, msglen);
+        nread = read(client.sock, buff, msglen);
 
         // Stop communicating with the client
         if (nread <= 0) break;
 
-        broadcast_msg(utf8_buff, client.id);
+        broadcast_msg(buff, client.id);
 
-    }
+    } 
 
     // Disconnect client
     remove_client(client, false);
-
-    sprintf(utf8_buff, "[SYSTEM] %.*s left the chat !", MAX_USERNAME_LENGTH, client.name);
-    broadcast_msg(utf8_buff, -1);
 
     return NULL;
 
@@ -258,8 +301,6 @@ int main(int argc, char* argv[]) {
         clients[i].sock = -1;
         clients[i].name = NULL;
     }
-
-    char msg_buff[MAX_MSG_LENGTH + 1];
 
     while(true) {
 
@@ -305,14 +346,21 @@ int main(int argc, char* argv[]) {
         inet_ntop(AF_INET, &(client_addr.sin_addr), addr_buff, INET_ADDRSTRLEN);
         printf("New connection from %s : ", addr_buff);
 
+        uint32_t pa_num;
+
         // Test if new connections are available
         err = sem_trywait(&available_connections);
         if (err != 0) {
             // No new connections available
-            write(client_sock, MAX_CONN_REACHED_MSG, strlen(MAX_CONN_REACHED_MSG));
+            pa_num = htonl(PA_ERRMAXCONN);
+            write(client_sock, &pa_num, sizeof(uint32_t));
             close(client_sock);
             continue;
         }
+
+        // Accept connection
+        pa_num = htonl(PA_CONNACCEPT);
+        write(client_sock, &pa_num, sizeof(uint32_t));
 
         char *username = read_username(client_sock);
 
@@ -320,28 +368,73 @@ int main(int argc, char* argv[]) {
 
         if (username == NULL) {
             sem_post(&available_connections);
+            pa_num = htonl(PA_ERRNAME);
+            write(client_sock, &pa_num, sizeof(uint32_t));
             close(client_sock);
             continue;
         }
 
         pthread_mutex_lock(&clients_lock);
 
-        // Get next available connection id
+        // Get next available connection id and check if username is available
         int conn_id;
         for (conn_id = 0; conn_id < MAX_CONNECTIONS; conn_id++) {
             if (clients[conn_id].sock == -1) break;
         }
 
-        free(clients[conn_id].name);
-        clients[conn_id].name = username;
-        clients[conn_id].sock = client_sock;
+        bool username_ok = true;
+        for (int i = 0; i < MAX_CONNECTIONS; i++) {
+            if (clients[i].sock != -1 && !strcmp(clients[i].name, username)) {
+                username_ok = false;
+                break;
+            }
+        }
 
         pthread_mutex_unlock(&clients_lock);
 
-        sprintf(msg_buff, "[SYSTEM] %.*s joined the chat !", MAX_USERNAME_LENGTH, username);
-        broadcast_msg(msg_buff, -1);
+        if (!username_ok) {
+            sem_post(&available_connections);
+            pa_num = htonl(PA_ERRNAME);
+            write(client_sock, &pa_num, sizeof(uint32_t));
+            close(client_sock);
+            continue;
+        }
+
+        // Send client id
+        uint32_t id_packet[2] = {htonl(PA_USERID), htonl(conn_id)};
+        write(client_sock, id_packet, sizeof(id_packet));
+
+        
+        // Send client list
+
+        pthread_mutex_lock(&clients_lock);
+
+        pa_num = htonl(PA_USRLIST);
+        uint32_t num_clients = htonl(nb_clients);
+        write(client_sock, &pa_num, sizeof(uint32_t));
+        write(client_sock, &num_clients, sizeof(uint32_t));
+
+        for (int i = 0; i < MAX_CONNECTIONS; i++) {
+            
+            if (clients[i].sock == -1) continue;
+
+            uint32_t usr_packet[2] = {htonl(clients[i].id), htonl(strlen(clients[i].name) + 1)};
+            write(client_sock, usr_packet, sizeof(uint32_t) * 2);
+            write(client_sock, clients[i].name, strlen(clients[i].name) + 1);
+
+        }
+
+        // Add client to list;
+        free(clients[conn_id].name);
+        clients[conn_id].name = username;
+        clients[conn_id].sock = client_sock;
+        nb_clients++;
+
+        pthread_mutex_unlock(&clients_lock);
 
         pthread_create(&client_threads[conn_id], NULL, handle_client, &clients[conn_id]);
+        
+        broadcast_join_message(conn_id);
 
     }
 
