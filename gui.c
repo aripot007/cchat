@@ -249,6 +249,8 @@ void print_system_msg(char *msg, ...) {
 
 void display_userlist(struct client *clients) {
 
+    wclear(users_win);
+
     wmove(users_win, 0, 0);
 
     struct client *c = clients;
