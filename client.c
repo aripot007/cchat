@@ -1,4 +1,5 @@
 #include <arpa/inet.h>
+#include <libnotify/notify.h>
 #include <stdint.h>
 #include <sys/poll.h>
 #include <sys/types.h>
@@ -77,6 +78,21 @@ Socket init_socket(char *host, char *port) {
 
 }
 
+void send_notification(char *title, char *msg) {
+    // Create the notification: (summary, body, icon)
+    NotifyNotification *notification = notify_notification_new(
+        title,              // Title
+        msg, // Body
+        NULL    // Icon (can be NULL)
+    );
+
+    // Show the notification
+    notify_notification_show(notification, NULL);
+
+    // cleanup
+    g_object_unref(G_OBJECT(notification));
+}
+
 void throw(const char *format, ...) {
     va_list args;
     va_start(args, format);
@@ -127,6 +143,8 @@ void handle_client_message() {
 
     print_user_msg("%s : %s", get_client_name(id), msg_buff);
 
+    send_notification(get_client_name(id), msg_buff);
+
 }
 
 void handle_system_message() {
@@ -148,6 +166,8 @@ void handle_system_message() {
     }    
 
     print_user_msg("%s", msg_buff);
+
+    send_notification("CChat", msg_buff);
 }
 
 void handle_new_client() {
@@ -168,6 +188,7 @@ void handle_new_client() {
 
     display_userlist(clients);
     print_system_msg("%s joined the chat !", c->name);
+    send_notification(c->name, "joined the chat !");
 
 }
 
@@ -202,6 +223,8 @@ void handle_client_leave() {
 
     print_system_msg("%s left the chat !", c->name);
     display_userlist(clients);
+
+    send_notification(c->name, "left the chat !");
 
     free(c->name);
     free(c);
@@ -294,7 +317,6 @@ int main(int argc, char* argv[]) {
         return EXIT_FAILURE;
     }
 
-
     // Send username information
     uint32_t username_packet[2] = {htonl(PA_USERNAME), htonl(username_length + 1)};
     write(sock, username_packet, 2 * sizeof(uint32_t));
@@ -356,6 +378,11 @@ int main(int argc, char* argv[]) {
     }
 
     init_gui(MAX_MSG_LENGTH - 1);
+
+    // Init notifications
+    if (!notify_init("CChat")) {
+        exit(1);
+    }
 
     display_userlist(clients);
 
@@ -423,5 +450,6 @@ int main(int argc, char* argv[]) {
 
     sleep(5);
     destroy_gui();
+    notify_uninit();
     return EXIT_SUCCESS;
 }
