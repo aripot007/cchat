@@ -1,5 +1,6 @@
 #include <arpa/inet.h>
 #include <libnotify/notify.h>
+#include <openssl/types.h>
 #include <stdint.h>
 #include <sys/poll.h>
 #include <sys/types.h>
@@ -23,8 +24,12 @@
 #include "gui.h"
 #include "packets.h"
 #include "client.h"
+#include <openssl/ssl.h>
+#include <openssl/err.h>
 
 Socket sock;
+SSL_CTX *ssl_ctx;
+int sock_fd;
 uint32_t client_id;
 
 struct client *clients = NULL;
@@ -38,7 +43,22 @@ void print_usage(char *progName) {
 
 Socket init_socket(char *host, char *port) {
 
-    Socket s;
+    // Create new SSL context    
+    ssl_ctx = SSL_CTX_new(TLS_client_method());
+    if (ssl_ctx == NULL) {
+        perror("Unable to create SSL context");
+        ERR_print_errors_fp(stderr);
+        exit(EXIT_FAILURE);
+    }
+
+    // Use cchat CA for certificate verification
+    if (!SSL_CTX_load_verify_locations(ssl_ctx, "ssl/ca-cert.pem", NULL)) {
+        ERR_print_errors_fp(stderr);
+        exit(EXIT_FAILURE);
+    }
+
+    // Abort connection if handshake fails
+    SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, NULL);
 
     struct addrinfo *res = NULL;
 
@@ -51,31 +71,83 @@ Socket init_socket(char *host, char *port) {
     int err = getaddrinfo(host, port, &hints, &res);
     if(err != 0) {
         fprintf(stderr, "%s\n", gai_strerror(err));
-        return -1;
+        return NULL;
     }
 
     struct addrinfo *rp;
 
     for(rp = res; rp != NULL; rp = rp->ai_next) {
 
-        s = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        sock_fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
 
-        if (s == -1) continue;
+        if (sock_fd == -1) continue;
 
-        if (connect(s, rp->ai_addr, rp->ai_addrlen) != -1) break;  /* Success */
+        if (connect(sock_fd, rp->ai_addr, rp->ai_addrlen) != -1) break;  /* Success */
 
-        close(s);
+        close(sock_fd);
 
     }
 
     freeaddrinfo(res);
     if (rp == NULL) {
         fprintf(stderr, "Could not connect to host\n");
-        return -1;
+        return NULL;
     }
 
-    return s;
+     /* Create client SSL structure using dedicated client socket */
+    SSL *ssl = SSL_new(ssl_ctx);
+    if (!SSL_set_fd(ssl, sock_fd)) {
+        ERR_print_errors_fp(stderr);
+        goto exit;
+    }
 
+    /* Configure server hostname check */
+    if (!SSL_set1_host(ssl, SSL_SERVER_HOSTNAME)) {
+        ERR_print_errors_fp(stderr);
+        goto exit;
+    }
+    
+    /* Now do SSL connect with server */
+    if (SSL_connect(ssl) != 1) {
+        
+        long verify_result = SSL_get_verify_result(ssl);
+        if (verify_result != X509_V_OK) {
+            printf("SSL certificate verification failed: %s", X509_verify_cert_error_string(verify_result));
+        }
+        
+        printf("SSL connection to server failed");
+        
+        ERR_print_errors_fp(stderr);
+        exit:
+        /* Close up */
+        if (ssl != NULL) {
+            SSL_shutdown(ssl);
+            SSL_free(ssl);
+        }
+        SSL_CTX_free(ssl_ctx);
+        ssl_ctx = NULL;
+        
+        if (sock_fd != -1)
+            close(sock_fd);
+        return NULL;
+    }
+    
+    return ssl;
+
+}
+
+void close_socket() {
+    /* Close up */
+    if (sock != NULL) {
+        SSL_shutdown(sock);
+        SSL_free(sock);
+    }
+    if (ssl_ctx != NULL) {
+        SSL_CTX_free(ssl_ctx);
+    }
+    
+    if (sock_fd != -1)
+        close(sock_fd);
 }
 
 void send_notification(char *title, char *msg) {
@@ -99,6 +171,7 @@ void throw(const char *format, ...) {
     destroy_gui();
     vfprintf(stderr, format, args);
     fprintf(stderr, "\n");
+    close_socket();
     exit(EXIT_FAILURE);
 }
 
@@ -122,22 +195,22 @@ char *get_client_name(uint32_t id) {
 void handle_client_message() {
 
     uint32_t id;
-    read(sock, &id, sizeof(uint32_t));
+    SSL_read(sock, &id, sizeof(uint32_t));
     id = ntohl(id);
 
     uint32_t len;
-    read(sock, &len, sizeof(uint32_t));
+    SSL_read(sock, &len, sizeof(uint32_t));
     len = ntohl(len);
 
     if (len >= sizeof(msg_buff)) {
-        close(sock);
+        close_socket();
         throw("Error while receiving message : packet too large (got %d, buffer is %d)", len, sizeof(msg_buff));
     }
 
-    uint32_t nread = read(sock, msg_buff, len);
+    uint32_t nSSL_read = SSL_read(sock, msg_buff, len);
 
-    if (nread != len) {
-        close(sock);
+    if (nSSL_read != len) {
+        close_socket();
         throw("Error while receiving message : packet size does not match");
     }    
 
@@ -150,18 +223,18 @@ void handle_client_message() {
 void handle_system_message() {
 
     uint32_t len;
-    read(sock, &len, sizeof(uint32_t));
+    SSL_read(sock, &len, sizeof(uint32_t));
     len = ntohl(len);
 
     if (len >= sizeof(msg_buff)) {
-        close(sock);
+        close_socket();
         throw("Error while receiving message : packet too large (got %d, buffer is %d)", len, sizeof(msg_buff));
     }
 
-    uint32_t nread = read(sock, msg_buff, len);
+    uint32_t nSSL_read = SSL_read(sock, msg_buff, len);
 
-    if (nread != len) {
-        close(sock);
+    if (nSSL_read != len) {
+        close_socket();
         throw("Error while receiving message : packet size does not match");
     }    
 
@@ -173,15 +246,15 @@ void handle_system_message() {
 void handle_new_client() {
 
     struct client *c = malloc(sizeof(struct client));
-    read(sock, &c->id, sizeof(uint32_t));
+    SSL_read(sock, &c->id, sizeof(uint32_t));
     c->id = ntohl(c->id);
     
     uint32_t username_len;
-    read(sock, &username_len, sizeof(uint32_t));
+    SSL_read(sock, &username_len, sizeof(uint32_t));
     username_len = ntohl(username_len);
     
     c->name = malloc(sizeof(char) * username_len);
-    read(sock, c->name, username_len);
+    SSL_read(sock, c->name, username_len);
     
     c->next = clients;
     clients = c;
@@ -195,7 +268,7 @@ void handle_new_client() {
 void handle_client_leave() {
 
     uint32_t id;
-    read(sock, &id, sizeof(uint32_t));
+    SSL_read(sock, &id, sizeof(uint32_t));
     id = ntohl(id);
 
     // Remove client from list
@@ -236,11 +309,11 @@ void handle_receive() {
     uint32_t resp;
     size_t nread = 0;
 
-    nread = read(sock, &resp, sizeof(uint32_t));
+    nread = SSL_read(sock, &resp, sizeof(uint32_t));
     resp = ntohl(resp);
 
     if (nread != sizeof(uint32_t)) {
-        close(sock);
+        close_socket();
         throw("Error while reading packet number (read %d instead of %d)", nread, sizeof(uint32_t));
     }
 
@@ -266,7 +339,7 @@ void handle_receive() {
             print_system_msg("[ERROR] Wrong packet received : %d. Quitting in 5 seconds ...", resp);
             sleep(5);
             destroy_gui();
-            close(sock);
+            close_socket();
             fprintf(stderr, "Error : wrong packet received.\n");
             exit(EXIT_SUCCESS);
     }
@@ -299,12 +372,12 @@ int main(int argc, char* argv[]) {
     
     sock = init_socket(argv[2], (port == -1 ? DEFAULT_PORT_STR : argv[3]));
 
-    if (sock < 0 ) {
+    if (sock == NULL ) {
         return EXIT_FAILURE;
     }
 
     uint32_t resp;
-    read(sock, &resp, sizeof(uint32_t));
+    SSL_read(sock, &resp, sizeof(uint32_t));
     resp = ntohl(resp);
 
     if (resp == PA_ERRMAXCONN) {
@@ -313,27 +386,27 @@ int main(int argc, char* argv[]) {
     }
 
     if (resp != PA_CONNACCEPT) {
-        printf("Error while reading server response : got packet number %d\n", resp);
+        printf("Error while SSL_reading server response : got packet number %d\n", resp);
         return EXIT_FAILURE;
     }
 
     // Send username information
     uint32_t username_packet[2] = {htonl(PA_USERNAME), htonl(username_length + 1)};
-    write(sock, username_packet, 2 * sizeof(uint32_t));
-    write(sock, username, username_length + 1);
+    SSL_write(sock, username_packet, 2 * sizeof(uint32_t));
+    SSL_write(sock, username, username_length + 1);
 
 
     // Read server response
-    read(sock, &resp, sizeof(uint32_t));
+    SSL_read(sock, &resp, sizeof(uint32_t));
     resp = ntohl(resp);
 
     switch (resp) {
         case PA_ERRNAME:
-            printf("Error : Username already taken\n");
+            printf("Error : Username alSSL_ready taken\n");
             return EXIT_FAILURE;
         
         case PA_USERID:
-            read(sock, &client_id, sizeof(uint32_t));
+            SSL_read(sock, &client_id, sizeof(uint32_t));
             client_id = ntohl(client_id);
             break;
         
@@ -344,16 +417,16 @@ int main(int argc, char* argv[]) {
 
     // Read users list
 
-    read(sock, &resp, sizeof(uint32_t));
+    SSL_read(sock, &resp, sizeof(uint32_t));
     resp = ntohl(resp);
 
     if (resp != PA_USRLIST) {
-        printf("Error while reading user list : %d\n", resp);
+        printf("Error while SSL_reading user list : %d\n", resp);
         return EXIT_FAILURE;
     }
 
     uint32_t num_clients;
-    read(sock, &num_clients, sizeof(uint32_t));
+    SSL_read(sock, &num_clients, sizeof(uint32_t));
     num_clients = ntohl(num_clients);
 
     for (uint32_t i = 0; i < num_clients; i++) {
@@ -363,14 +436,14 @@ int main(int argc, char* argv[]) {
 
         struct client *c = malloc(sizeof(struct client));
 
-        read(sock, &id, sizeof(uint32_t));
-        read(sock, &username_len, sizeof(uint32_t));
+        SSL_read(sock, &id, sizeof(uint32_t));
+        SSL_read(sock, &username_len, sizeof(uint32_t));
         id = ntohl(id);
         username_len = ntohl(username_len);
 
         c->id = id;
         c->name = malloc(sizeof(char) * username_len);
-        read(sock, c->name, username_len);
+        SSL_read(sock, c->name, username_len);
 
         c->next = clients;
         clients = c;
@@ -394,7 +467,7 @@ int main(int argc, char* argv[]) {
     fds[0].fd = STDIN_FILENO;
     fds[0].events = POLLIN;
 
-    fds[1].fd = sock;
+    fds[1].fd = sock_fd;
     fds[1].events = POLLIN;
 
     int poll_res;
@@ -406,7 +479,7 @@ int main(int argc, char* argv[]) {
         if (poll_res < 0 && errno != EINTR) {
             destroy_gui();
             fprintf(stderr, "Error while polling : %d\n", errno);
-            close(sock);
+            close_socket();
             return EXIT_FAILURE;
         }
 
@@ -430,8 +503,8 @@ int main(int argc, char* argv[]) {
                 int msg_len = strlen(msg) + 1;
 
                 uint32_t msg_packet[3] = {htonl(PA_MSG), 0, htonl(msg_len)};
-                write(sock, msg_packet, sizeof(msg_packet));
-                write(sock, msg, msg_len);
+                SSL_write(sock, msg_packet, sizeof(msg_packet));
+                SSL_write(sock, msg, msg_len);
 
                 print_user_msg("%s : %s", username, msg);
 

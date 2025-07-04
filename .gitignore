@@ -3,3 +3,6 @@ server
 
 *.o
 .vscode/
+ssl/ca-key.pem
+ssl/server-key.pem
+ssl/ca-cert.srl

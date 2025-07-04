@@ -6,4 +6,6 @@
 
 #define UTF8_SEQUENCE_MAXLEN 6
 
+#define SSL_SERVER_HOSTNAME "cchat"
+
 #endif

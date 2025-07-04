@@ -3,6 +3,8 @@
 #include <bits/pthreadtypes.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,6 +32,8 @@ pthread_mutex_t clients_lock;
 struct client *clients;
 pthread_t *client_threads;
 
+SSL_CTX *ssl_ctx = NULL;
+
 void print_usage(char *progName) {
     printf("Usage : %s [port]\n", progName);
 }
@@ -38,9 +42,10 @@ struct client {
     int id;
     char *name;
     Socket sock;
+    int sock_fd;
 };
 
-Socket init_socket(int port, int backlog_size) {
+int init_socket(int port, int backlog_size) {
 
     char port_str[6];
     if (port < 0 || port > 65536) {
@@ -67,7 +72,35 @@ Socket init_socket(int port, int backlog_size) {
     }
 
     struct addrinfo *rp;
-    Socket s = -1;
+    int s = -1;
+
+    // Create new SSL context    
+    ssl_ctx = SSL_CTX_new(TLS_server_method());
+    if (ssl_ctx == NULL) {
+        perror("Unable to create SSL context");
+        ERR_print_errors_fp(stderr);
+        exit(EXIT_FAILURE);
+    }
+
+    // Set the key and cert used to authenticate
+    if (SSL_CTX_use_certificate_chain_file(ssl_ctx, "ssl/server-cert.pem") <= 0) {
+        ERR_print_errors_fp(stderr);
+        exit(EXIT_FAILURE);
+    }
+    
+    if (SSL_CTX_use_PrivateKey_file(ssl_ctx, "ssl/server-key.pem", SSL_FILETYPE_PEM) <= 0) {
+        ERR_print_errors_fp(stderr);
+        exit(EXIT_FAILURE);
+    }
+
+    // Use scantor CA for certificate verification
+    if (!SSL_CTX_load_verify_locations(ssl_ctx, "ssl/ca-cert.pem", NULL)) {
+        ERR_print_errors_fp(stderr);
+        exit(EXIT_FAILURE);
+    }
+
+    // Abort connection if handshake fails
+    // SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_PEER, NULL);
 
     for(rp = res; rp != NULL; rp = rp->ai_next) {
 
@@ -103,6 +136,16 @@ Socket init_socket(int port, int backlog_size) {
 
 }
 
+void close_socket(int sock_fd, SSL *ssl) {
+    if (ssl != NULL) {
+        SSL_shutdown(ssl);
+        SSL_free(ssl);
+    }
+    if (sock_fd >= 0) {
+        close(sock_fd);
+    }
+}
+
 // Broadcast a message to all connected users
 void broadcast_msg(const char *buff, int from) {
 
@@ -113,9 +156,9 @@ void broadcast_msg(const char *buff, int from) {
     pthread_mutex_lock(&clients_lock);
 
     for (int i = 0; i < MAX_CONNECTIONS; i++) {
-        if (clients[i].sock < 0 || i == from) continue;
-        write(clients[i].sock, packet, sizeof(packet));
-        write(clients[i].sock, buff, len);
+        if (clients[i].sock == NULL || i == from) continue;
+        SSL_write(clients[i].sock, packet, sizeof(packet));
+        SSL_write(clients[i].sock, buff, len);
     }
 
     pthread_mutex_unlock(&clients_lock);
@@ -130,9 +173,9 @@ void broadcast_join_message(int client_id) {
     pthread_mutex_lock(&clients_lock);
 
     for (int i = 0; i < MAX_CONNECTIONS; i++) {
-        if (i == client_id || clients[i].sock == -1) continue;
-        write(clients[i].sock, &packet, sizeof(packet));
-        write(clients[i].sock, clients[client_id].name, username_len);
+        if (i == client_id || clients[i].sock == NULL) continue;
+        SSL_write(clients[i].sock, &packet, sizeof(packet));
+        SSL_write(clients[i].sock, clients[client_id].name, username_len);
     }
 
     pthread_mutex_unlock(&clients_lock);
@@ -146,8 +189,8 @@ void broadcast_leave_message(uint32_t client_id) {
     pthread_mutex_lock(&clients_lock);
 
     for (int i = 0; i < MAX_CONNECTIONS; i++) {
-        if (clients[i].sock == -1) continue;
-        write(clients[i].sock, &packet, sizeof(packet));
+        if (clients[i].sock == NULL) continue;
+        SSL_write(clients[i].sock, &packet, sizeof(packet));
     }
 
     pthread_mutex_unlock(&clients_lock);
@@ -161,25 +204,25 @@ char *read_username(Socket s) {
     uint32_t pa_num;
     uint32_t username_len;
 
-    nread = read(s, &pa_num, sizeof(uint32_t));
+    nread = SSL_read(s, &pa_num, sizeof(uint32_t));
     pa_num = ntohl(pa_num);
 
     if (nread != sizeof(uint32_t) || pa_num != PA_USERNAME) {
-        fprintf(stderr, "Error while reading username packet\n");
+        fprintf(stderr, "Error while SSL_reading username packet\n");
         return NULL;
     }
 
-    read(s, &username_len, sizeof(uint32_t));
+    SSL_read(s, &username_len, sizeof(uint32_t));
     username_len = ntohl(username_len);
 
     if (username_len > MAX_USERNAME_LENGTH) {
         username_len = MAX_USERNAME_LENGTH;
     }
 
-    nread = read(s, buff , sizeof(char) * username_len);
+    nread = SSL_read(s, buff , sizeof(char) * username_len);
 
     if (nread != (int) username_len) {
-        fprintf(stderr, "Error while reading username (%d read, username length = %d)\n", nread, username_len);
+        fprintf(stderr, "Error while SSL_reading username (%d SSL_read, username length = %d)\n", nread, username_len);
         return NULL;
     }
 
@@ -197,8 +240,9 @@ void remove_client(struct client client, bool cancel_thread) {
 
     pthread_mutex_lock(&clients_lock);
 
-    close(clients[client.id].sock);
-    clients[client.id].sock = -1;
+    close_socket(clients[client.id].sock_fd, clients[client.id].sock);
+    clients[client.id].sock_fd = -1;
+    clients[client.id].sock = NULL;
 
     if (cancel_thread) {
         pthread_cancel(client_threads[client.id]);
@@ -225,7 +269,7 @@ void *handle_client(void *args) {
 
     while (true) {
 
-        nread = read(client.sock, &pa_num, sizeof(uint32_t));
+        nread = SSL_read(client.sock, &pa_num, sizeof(uint32_t));
 
         // Stop communicating with the client
         if (nread <= 0) break;
@@ -239,9 +283,9 @@ void *handle_client(void *args) {
         }
 
         // Ignore client_id
-        read(client.sock, &pa_num, sizeof(uint32_t));
+        SSL_read(client.sock, &pa_num, sizeof(uint32_t));
 
-        nread = read(client.sock, &msglen, sizeof(uint32_t));
+        nread = SSL_read(client.sock, &msglen, sizeof(uint32_t));
         msglen = ntohl(msglen);
 
         if (nread < (int) sizeof(uint32_t)) {
@@ -251,12 +295,12 @@ void *handle_client(void *args) {
         }
 
         if (msglen > sizeof(buff)) {
-            printf("[ERROR] Error reading packet from '%s' : packet too large\n", client.name);
+            printf("[ERROR] Error SSL_reading packet from '%s' : packet too large\n", client.name);
             remove_client(client, true);
             return NULL;
         }
 
-        nread = read(client.sock, buff, msglen);
+        nread = SSL_read(client.sock, buff, msglen);
 
         // Stop communicating with the client
         if (nread <= 0) break;
@@ -289,7 +333,7 @@ int main(int argc, char* argv[]) {
     sem_init(&available_connections, 0, MAX_CONNECTIONS);
     pthread_mutex_init(&clients_lock, NULL);
 
-    Socket s = init_socket(port, CONN_BACKLOG_SIZE);
+    int s = init_socket(port, CONN_BACKLOG_SIZE);
 
     err = listen(s, CONN_BACKLOG_SIZE);
 
@@ -298,7 +342,8 @@ int main(int argc, char* argv[]) {
 
     for (int i = 0; i < MAX_CONNECTIONS; i++) {
         clients[i].id = i;
-        clients[i].sock = -1;
+        clients[i].sock_fd = -1;
+        clients[i].sock = NULL;
         clients[i].name = NULL;
     }
 
@@ -307,9 +352,9 @@ int main(int argc, char* argv[]) {
         struct sockaddr_in client_addr = {0};
         socklen_t addr_length = sizeof(struct sockaddr_in);
 
-        Socket client_sock = accept(s, (struct sockaddr*)&client_addr, &addr_length);
+        int client_sock_fd = accept(s, (struct sockaddr*)&client_addr, &addr_length);
 
-        if (client_sock == -1) {
+        if (client_sock_fd == -1) {
             fprintf(stderr, "Error while accepting client connection");
             switch (errno) {
             
@@ -342,6 +387,20 @@ int main(int argc, char* argv[]) {
             continue;
         }
 
+        /* Create server SSL structure using newly accepted client socket */
+        SSL *client_sock = SSL_new(ssl_ctx);
+        if (!SSL_set_fd(client_sock, client_sock_fd)) {
+            ERR_print_errors_fp(stderr);
+            exit(EXIT_FAILURE);
+        }
+        
+        /* Wait for SSL connection from the client */
+        if (SSL_accept(client_sock) <= 0) {
+            ERR_print_errors_fp(stderr);
+            close(client_sock_fd);
+            continue;
+        }
+
         char addr_buff[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &(client_addr.sin_addr), addr_buff, INET_ADDRSTRLEN);
         printf("New connection from %s : ", addr_buff);
@@ -353,14 +412,14 @@ int main(int argc, char* argv[]) {
         if (err != 0) {
             // No new connections available
             pa_num = htonl(PA_ERRMAXCONN);
-            write(client_sock, &pa_num, sizeof(uint32_t));
-            close(client_sock);
+            SSL_write(client_sock, &pa_num, sizeof(uint32_t));
+            close_socket(client_sock_fd, client_sock);
             continue;
         }
 
         // Accept connection
         pa_num = htonl(PA_CONNACCEPT);
-        write(client_sock, &pa_num, sizeof(uint32_t));
+        SSL_write(client_sock, &pa_num, sizeof(uint32_t));
 
         char *username = read_username(client_sock);
 
@@ -369,8 +428,8 @@ int main(int argc, char* argv[]) {
         if (username == NULL) {
             sem_post(&available_connections);
             pa_num = htonl(PA_ERRNAME);
-            write(client_sock, &pa_num, sizeof(uint32_t));
-            close(client_sock);
+            SSL_write(client_sock, &pa_num, sizeof(uint32_t));
+            close_socket(client_sock_fd, client_sock);
             continue;
         }
 
@@ -379,12 +438,12 @@ int main(int argc, char* argv[]) {
         // Get next available connection id and check if username is available
         int conn_id;
         for (conn_id = 0; conn_id < MAX_CONNECTIONS; conn_id++) {
-            if (clients[conn_id].sock == -1) break;
+            if (clients[conn_id].sock == NULL) break;
         }
 
         bool username_ok = true;
         for (int i = 0; i < MAX_CONNECTIONS; i++) {
-            if (clients[i].sock != -1 && !strcmp(clients[i].name, username)) {
+            if (clients[i].sock != NULL && !strcmp(clients[i].name, username)) {
                 username_ok = false;
                 break;
             }
@@ -395,32 +454,31 @@ int main(int argc, char* argv[]) {
         if (!username_ok) {
             sem_post(&available_connections);
             pa_num = htonl(PA_ERRNAME);
-            write(client_sock, &pa_num, sizeof(uint32_t));
-            close(client_sock);
+            SSL_write(client_sock, &pa_num, sizeof(uint32_t));
+            close_socket(client_sock_fd, client_sock);
             continue;
         }
 
         // Send client id
         uint32_t id_packet[2] = {htonl(PA_USERID), htonl(conn_id)};
-        write(client_sock, id_packet, sizeof(id_packet));
+        SSL_write(client_sock, id_packet, sizeof(id_packet));
 
-        
         // Send client list
 
         pthread_mutex_lock(&clients_lock);
 
         pa_num = htonl(PA_USRLIST);
         uint32_t num_clients = htonl(nb_clients);
-        write(client_sock, &pa_num, sizeof(uint32_t));
-        write(client_sock, &num_clients, sizeof(uint32_t));
+        SSL_write(client_sock, &pa_num, sizeof(uint32_t));
+        SSL_write(client_sock, &num_clients, sizeof(uint32_t));
 
         for (int i = 0; i < MAX_CONNECTIONS; i++) {
             
-            if (clients[i].sock == -1) continue;
+            if (clients[i].sock == NULL) continue;
 
             uint32_t usr_packet[2] = {htonl(clients[i].id), htonl(strlen(clients[i].name) + 1)};
-            write(client_sock, usr_packet, sizeof(uint32_t) * 2);
-            write(client_sock, clients[i].name, strlen(clients[i].name) + 1);
+            SSL_write(client_sock, usr_packet, sizeof(uint32_t) * 2);
+            SSL_write(client_sock, clients[i].name, strlen(clients[i].name) + 1);
 
         }
 
@@ -428,6 +486,7 @@ int main(int argc, char* argv[]) {
         free(clients[conn_id].name);
         clients[conn_id].name = username;
         clients[conn_id].sock = client_sock;
+        clients[conn_id].sock_fd = client_sock_fd;
         nb_clients++;
 
         pthread_mutex_unlock(&clients_lock);
